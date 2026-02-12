@@ -1,7 +1,5 @@
 # Quick Start Guide
 
-Get Mini-Torrent running in 5 minutes.
-
 ## Step 1: Install Python
 
 Download Python 3.11+: https://www.python.org/downloads/
