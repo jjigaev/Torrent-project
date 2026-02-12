@@ -1,8 +1,7 @@
 # Mini-Torrent Client
 
 A fully functional BitTorrent client with web interface built with Python and FastAPI.
-
-![Mini-Torrent Interface](screenshots/main-interface.png)
+<img width="1919" height="882" alt="image" src="https://github.com/user-attachments/assets/881706e9-1057-44aa-a292-3d525b7d2504" />
 
 ## Features
 
@@ -124,20 +123,6 @@ The server will start on `http://localhost:8000`
 
 Click the settings icon (⚙️) in top-right corner to switch themes.
 
-## Screenshots
-
-### Main Interface
-![Main Interface](screenshots/main-interface.png)
-
-### Download Progress
-![Download Progress](screenshots/download-progress.png)
-
-### Control Panel
-![Control Panel](screenshots/control-panel.png)
-
-### Add Torrent Modal
-![Add Torrent](screenshots/add-torrent.png)
-
 ## API Documentation
 
 Once the server is running, visit:
@@ -163,8 +148,7 @@ Edit `web_server.py`:
 
 ```python
 # Change port
-uvicorn.run(app, host="0.0.0.0", port=8000)  # Change 8000 to desired port
-
+uvicorn.run(app, host="localhost", port=8000)  
 # Change download directory
 PieceManager(torrent, download_dir="downloads")  # Change "downloads" path
 ```
@@ -180,7 +164,7 @@ MAX_INFLIGHT_PER_PEER = 10  # Requests per peer (higher = faster)
 Edit `src/piece_manager.py`:
 
 ```python
-BLOCK_SIZE = 16384  # Block size in bytes (16KB default)
+BLOCK_SIZE = 16384  # Block size in bytes (16KB)
 ```
 
 ## Troubleshooting
@@ -216,10 +200,6 @@ kill -9 <PID>
 active_peers = [p for p in results if p is not None][:20]  # Increase from [:10]
 ```
 
-### Multi-file Torrents Not Extracting
-
-This is fixed in the latest version. Ensure you have the updated `piece_manager.py`.
-
 ### WebSocket Connection Failed
 
 1. Check server is running
@@ -228,15 +208,6 @@ This is fixed in the latest version. Ensure you have the updated `piece_manager.
 
 ## Development
 
-### Running Tests
-
-```bash
-# Test bencode encoder/decoder
-python -c "from src.bencode import encode, decode; print(decode(encode({'test': 123})))"
-
-# Test torrent parser
-python -c "from src.torrent import TorrentFile; t=TorrentFile('torrents/test.torrent'); print(t.name)"
-```
 
 ### Project Architecture
 
@@ -261,39 +232,19 @@ User Request → FastAPI → Tracker → Peers → Download → Verify → Save
 - 5-10 peers: 200-500 KB/s
 - 10+ peers: 500 KB/s - 2 MB/s
 
-**Factors Affecting Speed:**
-- Number of seeders
-- Network connection
-- Peer upload speeds
-- Number of parallel connections
-
 ## Limitations
 
 - UDP trackers not supported (HTTP/HTTPS only)
 - DHT not implemented
 - No resume capability (restart from beginning)
-- No seeding support (download only)
-- NAT traversal limited
 
 ## Future Improvements
 
 - [ ] DHT support
 - [ ] UDP tracker support
 - [ ] Resume download functionality
-- [ ] Seeding capability
 - [ ] Magnet link support
 - [ ] Download queue management
-- [ ] Bandwidth limiting
-- [ ] Port forwarding/UPnP
-
-## Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
 
 ## License
 
@@ -304,10 +255,6 @@ This project is for educational purposes.
 - BitTorrent Protocol Specification (BEP 0003)
 - FastAPI Documentation
 - WebSocket Protocol RFC 6455
-
-## Contact
-
-For issues and questions, please open an issue on GitHub.
 
 ---
 
