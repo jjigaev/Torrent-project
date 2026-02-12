@@ -1,10 +1,5 @@
-/* ============================================================================
-   MINI-TORRENT CLIENT STYLES
-   Based on Figma Design - Dark Theme with Green Accents
-   ============================================================================ */
-
 :root {
-    /* Colors */
+
     --bg-primary: #0f172a;
     --bg-secondary: #1e293b;
     --bg-tertiary: #27374d;
