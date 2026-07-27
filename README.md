@@ -1,7 +1,6 @@
 # Mini-Torrent Client
 
 A fully functional BitTorrent client with web interface built with Python and FastAPI.
-<img width="1919" height="882" alt="image" src="https://github.com/user-attachments/assets/881706e9-1057-44aa-a292-3d525b7d2504" />
 
 ## Features
 
