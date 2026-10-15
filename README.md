@@ -263,6 +263,15 @@ User Request → FastAPI → Tracker → Peers → Download → Verify → Save
 5. Verify pieces (SHA-1 hash)
 6. Save to disk (assemble pieces)
 
+Blocks are written to temporary disk storage as they arrive; verified payloads
+are not retained in RAM. Storage slots follow arrival order, so receiving a high
+piece index does not create a large hole on filesystems without sparse files.
+At most 20 pieces are reserved at once. SHA-1 verification and final assembly use
+bounded buffers. Pause keeps the open temporary storage; completion, deletion,
+and graceful shutdown close and remove it. Final output files are replaced only
+after their temporary output is complete. Assembly can temporarily require
+additional disk space up to the size of the current output file.
+
 ## Performance
 
 **Typical Speeds:**
@@ -274,7 +283,7 @@ User Request → FastAPI → Tracker → Peers → Download → Verify → Save
 
 - UDP trackers not supported (HTTP/HTTPS only)
 - DHT not implemented
-- Verified pieces survive pause/resume in memory; restarting the process loses download state
+- Verified pieces survive pause/resume in temporary disk storage; restarting the process loses download state
 
 ## Future Improvements
 

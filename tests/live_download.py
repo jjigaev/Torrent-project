@@ -68,9 +68,12 @@ async def check(args, directory):
             await asyncio.sleep(0.01)
         else:
             raise TimeoutError("Test server did not start")
+        report("server", url=f"http://127.0.0.1:{port}")
 
+        # Heartbeats are 5 seconds apart, matching Uvicorn's idle timeout.
+        # Expire pooled sockets earlier rather than racing its idle close.
         async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=90,
-                                     trust_env=False) as client:
+                                     limits=httpx.Limits(keepalive_expiry=2), trust_env=False) as client:
             root = await client.get("/")
             root.raise_for_status()
             parser = SessionParser()
@@ -93,14 +96,17 @@ async def check(args, directory):
 
             def verify_hashes():
                 manager = data["piece_manager"]
-                with manager._lock:
-                    verified = dict(manager.piece_data)
+                verified = manager.verified_piece_indices()
                 if not verified:
                     raise AssertionError("No real payload pieces were received")
-                for index, content in verified.items():
-                    if hashlib.sha1(content).digest() != torrent.pieces[index]:
+                for index in verified:
+                    digest = hashlib.sha1()
+                    length = manager.get_piece_length(index)
+                    for offset in range(0, length, manager.BLOCK_SIZE):
+                        digest.update(manager.read_verified_block(index, offset, min(manager.BLOCK_SIZE, length - offset)))
+                    if digest.digest() != torrent.pieces[index]:
                         raise AssertionError(f"Invalid SHA-1 for piece {index}")
-                return verified
+                return set(verified)
 
             async def wait_for_bytes(target, stage):
                 deadline = time.monotonic() + args.stage_timeout
@@ -144,19 +150,20 @@ async def check(args, directory):
             response.raise_for_status()
             await wait_for_bytes(paused["verified_bytes"] + threshold, "downloaded_after_resume")
             manager = data["piece_manager"]
-            with manager._lock:
-                if any(manager.piece_data.get(index) != content for index, content in before.items()):
-                    raise AssertionError("Resume lost previously verified pieces")
+            verified = verify_hashes()
+            if not before.issubset(verified):
+                raise AssertionError("Resume lost previously verified pieces")
 
             deletion_started = time.monotonic()
             response = await client.delete(endpoint)
             response.raise_for_status()
-            verified = verify_hashes()
             deleted = snapshot()
             if info_hash in application.active_torrents or not data["task"].done():
                 raise AssertionError("Delete left an active torrent or worker")
             if manager.has_pending() or data["connections"]:
                 raise AssertionError("Delete left blocks or sockets active")
+            if not manager.closed or list(application.DOWNLOAD_DIR.glob(".minitorrent-*")):
+                raise AssertionError("Delete left partial storage open or on disk")
             disk_state = {str(item.relative_to(directory)): item.stat().st_size
                           for item in directory.rglob("*") if item.is_file()}
             await asyncio.sleep(args.pause_seconds)
@@ -169,11 +176,13 @@ async def check(args, directory):
             if listed.json()["torrents"]:
                 raise AssertionError("Deleted torrent is still listed")
             report("delete_passed", seconds=round(time.monotonic() - deletion_started, 3), **deleted)
-            report("passed", verified_pieces=len(verified), verified_bytes=deleted["verified_bytes"],
+            report("passed", verified_pieces=len(verified),
+                   verified_bytes=sum(manager.get_piece_length(index) for index in verified),
+                   downloaded_bytes_at_delete=deleted["verified_bytes"], storage_closed=manager.closed,
                    seconds=round(time.monotonic() - started_at, 3), full_iso=False)
     finally:
         if data is not None:
-            await application._stop_download(data)
+            await application._dispose_download(data)
         server.should_exit = True
         await serving
         listener.close()
