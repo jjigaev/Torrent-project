@@ -42,8 +42,8 @@ Done!
 
 **Port 8000 in use?**
 ```bash
-# Change port in web_server.py line 297:
-uvicorn.run(app, host="0.0.0.0", port=8001)
+# Change port in web_server.py:
+uvicorn.run(app, host="localhost", port=8001)
 ```
 
 **Module not found?**
