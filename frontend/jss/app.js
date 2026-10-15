@@ -1,7 +1,8 @@
 
 class TorrentClient {
     constructor() {
-        this.apiBase = 'http://localhost:8000/api';
+        this.apiBase = '/api';
+        this.apiToken = document.querySelector('meta[name="api-token"]')?.content || '';
         this.ws = null;
         this.torrents = new Map();
         this.filteredTorrents = [];
@@ -23,7 +24,9 @@ class TorrentClient {
     // ========================================================================
 
     setupWebSocket() {
-        this.ws = new WebSocket('ws://localhost:8000/ws');
+        const url = new URL('/ws', window.location.href);
+        url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        this.ws = new WebSocket(url.href);
         
         this.ws.onopen = () => console.log('✅ WebSocket connected');
         this.ws.onmessage = (event) => this.handleWebSocketMessage(JSON.parse(event.data));
@@ -47,7 +50,7 @@ class TorrentClient {
             case 'status_update':
                 const t = this.torrents.get(data.info_hash);
                 if (t) {
-                    t.status = data.status;
+                    Object.assign(t, data);
                     this.applyFilters();
                 }
                 break;
@@ -65,6 +68,11 @@ class TorrentClient {
                 this.applyFilters();
                 break;
             case 'error':
+                const failed = this.torrents.get(data.info_hash);
+                if (failed) {
+                    Object.assign(failed, data);
+                    this.applyFilters();
+                }
                 alert(`❌ Error: ${data.message || 'Unknown error'}`);
                 break;
         }
@@ -237,10 +245,18 @@ class TorrentClient {
     // API Calls
     // ========================================================================
 
+    async apiRequest(endpoint, options = {}) {
+        const headers = new Headers(options.headers);
+        headers.set('Authorization', `Bearer ${this.apiToken}`);
+        const response = await fetch(`${this.apiBase}${endpoint}`, { ...options, headers });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Request failed');
+        return data;
+    }
+
     async loadTorrents() {
         try {
-            const response = await fetch(`${this.apiBase}/torrents`);
-            const data = await response.json();
+            const data = await this.apiRequest('/torrents');
             
             this.torrents.clear();
             data.torrents.forEach(t => this.torrents.set(t.info_hash, t));
@@ -261,13 +277,11 @@ class TorrentClient {
         formData.append('file', file);
 
         try {
-            const response = await fetch(`${this.apiBase}/torrents/add`, {
+            const data = await this.apiRequest('/torrents/add', {
                 method: 'POST',
                 body: formData
             });
 
-            const data = await response.json();
-            
             if (data.success) {
                 alert(`✅ Added: ${data.name}`);
                 this.closeModal();
@@ -281,10 +295,10 @@ class TorrentClient {
 
     async startTorrent(infoHash) {
         try {
-            await fetch(`${this.apiBase}/torrents/${infoHash}/start`, { method: 'POST' });
+            const data = await this.apiRequest(`/torrents/${infoHash}/start`, { method: 'POST' });
             const torrent = this.torrents.get(infoHash);
             if (torrent) {
-                torrent.status = 'downloading';
+                torrent.status = data.status;
                 this.applyFilters();
             }
         } catch (error) {
@@ -294,10 +308,10 @@ class TorrentClient {
 
     async pauseTorrent(infoHash) {
         try {
-            await fetch(`${this.apiBase}/torrents/${infoHash}/pause`, { method: 'POST' });
+            const data = await this.apiRequest(`/torrents/${infoHash}/pause`, { method: 'POST' });
             const torrent = this.torrents.get(infoHash);
             if (torrent) {
-                torrent.status = 'paused';
+                torrent.status = data.status;
                 this.applyFilters();
             }
         } catch (error) {
@@ -309,7 +323,9 @@ class TorrentClient {
         if (!confirm('Remove this torrent?')) return;
         
         try {
-            await fetch(`${this.apiBase}/torrents/${infoHash}`, { method: 'DELETE' });
+            await this.apiRequest(`/torrents/${infoHash}`, { method: 'DELETE' });
+            this.torrents.delete(infoHash);
+            this.applyFilters();
         } catch (error) {
             console.error('Error deleting:', error);
         }
@@ -351,7 +367,7 @@ class TorrentClient {
         div.innerHTML = `
             <div class="torrent-header">
                 <div class="torrent-info">
-                    <div class="torrent-name">${t.name}</div>
+                    <div class="torrent-name"></div>
                     <div class="torrent-stats">
                         <span>${this.formatSize(t.total_size)}</span>
                         <span>↓ ${this.formatSpeed(t.download_speed || 0)}</span>
@@ -360,8 +376,8 @@ class TorrentClient {
                     </div>
                 </div>
                 <div class="torrent-actions">
-                    <button class="action-btn" onclick="event.stopPropagation(); client.${action}('${t.info_hash}')" title="${isDownloading ? 'Pause' : 'Start'}">${icon}</button>
-                    <button class="action-btn" onclick="event.stopPropagation(); client.deleteTorrent('${t.info_hash}')" title="Delete">✕</button>
+                    <button class="action-btn" data-action="toggle" title="${isDownloading ? 'Pause' : 'Start'}">${icon}</button>
+                    <button class="action-btn" data-action="delete" title="Delete">✕</button>
                 </div>
             </div>
             <div class="progress-container">
@@ -371,6 +387,16 @@ class TorrentClient {
                 </div>
             </div>
         `;
+
+        div.querySelector('.torrent-name').textContent = t.name;
+        div.querySelector('[data-action="toggle"]').addEventListener('click', (event) => {
+            event.stopPropagation();
+            this[action](t.info_hash);
+        });
+        div.querySelector('[data-action="delete"]').addEventListener('click', (event) => {
+            event.stopPropagation();
+            this.deleteTorrent(t.info_hash);
+        });
 
         return div;
     }
@@ -395,11 +421,11 @@ class TorrentClient {
         
         container.innerHTML = `
             <div class="panel-container">
-                <h2>${t.name}</h2>
+                <h2></h2>
                 <div style="margin-top: 20px; color: var(--text-secondary);">
                     <p><strong>Size:</strong> ${this.formatSize(t.total_size)}</p>
                     <p><strong>Progress:</strong> ${t.progress.toFixed(1)}%</p>
-                    <p><strong>Status:</strong> ${t.status}</p>
+                    <p><strong>Status:</strong> <span class="panel-status"></span></p>
                     <p><strong>Download Speed:</strong> ${this.formatSpeed(t.download_speed || 0)}</p>
                     <p><strong>Upload Speed:</strong> ${this.formatSpeed(t.upload_speed || 0)}</p>
                     <p><strong>Peers Connected:</strong> ${t.peers_connected || 0}</p>
@@ -407,6 +433,8 @@ class TorrentClient {
                 </div>
             </div>
         `;
+        container.querySelector('h2').textContent = t.name;
+        container.querySelector('.panel-status').textContent = t.status;
     }
 
     updateGlobalStats() {
