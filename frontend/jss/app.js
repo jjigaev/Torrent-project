@@ -28,7 +28,10 @@ class TorrentClient {
         url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         this.ws = new WebSocket(url.href);
         
-        this.ws.onopen = () => console.log('✅ WebSocket connected');
+        this.ws.onopen = () => {
+            console.log('✅ WebSocket connected');
+            return this.loadTorrents();
+        };
         this.ws.onmessage = (event) => this.handleWebSocketMessage(JSON.parse(event.data));
         this.ws.onerror = (error) => console.error('❌ WebSocket error:', error);
         this.ws.onclose = () => {
@@ -45,22 +48,11 @@ class TorrentClient {
                 this.loadTorrents();
                 break;
             case 'progress_update':
+            case 'status_update':
                 this.updateTorrentFromWS(data);
                 break;
-            case 'status_update':
-                const t = this.torrents.get(data.info_hash);
-                if (t) {
-                    Object.assign(t, data);
-                    this.applyFilters();
-                }
-                break;
             case 'completed':
-                const torrent = this.torrents.get(data.info_hash);
-                if (torrent) {
-                    torrent.status = 'completed';
-                    torrent.progress = 100;
-                    this.applyFilters();
-                }
+                this.updateTorrentFromWS({ ...data, status: 'completed', progress: 100 });
                 alert(`✅ Download completed!`);
                 break;
             case 'torrent_removed':
@@ -68,11 +60,7 @@ class TorrentClient {
                 this.applyFilters();
                 break;
             case 'error':
-                const failed = this.torrents.get(data.info_hash);
-                if (failed) {
-                    Object.assign(failed, data);
-                    this.applyFilters();
-                }
+                this.updateTorrentFromWS(data);
                 alert(`❌ Error: ${data.message || 'Unknown error'}`);
                 break;
         }
@@ -82,12 +70,12 @@ class TorrentClient {
         const torrent = this.torrents.get(data.info_hash);
         if (!torrent) return;
 
-        torrent.progress = data.progress || 0;
-        torrent.downloaded_pieces = data.downloaded_pieces || 0;
-        torrent.download_speed = data.download_speed || 0;
-        torrent.upload_speed = data.upload_speed || 0;
-        torrent.peers_connected = data.peers_connected || 0;
-        if (data.status) torrent.status = data.status;
+        const previousStatus = torrent.status;
+        Object.assign(torrent, data);
+        if (torrent.status !== previousStatus) {
+            this.applyFilters();
+            return;
+        }
 
         const el = document.querySelector(`[data-hash="${data.info_hash}"]`);
         if (el) {
@@ -97,7 +85,7 @@ class TorrentClient {
             
             if (bar) {
                 bar.style.width = `${torrent.progress}%`;
-                if (torrent.progress >= 100) bar.classList.add('completed');
+                bar.classList.toggle('completed', torrent.status === 'completed');
             }
             if (text) text.textContent = `${torrent.progress.toFixed(1)}%`;
             if (stats) {
@@ -110,6 +98,7 @@ class TorrentClient {
             }
         }
         
+        this.syncSelectedTorrent();
         this.updateGlobalStats();
     }
 
@@ -206,7 +195,7 @@ class TorrentClient {
         if (this.currentFilter === 'Downloading') {
             filtered = filtered.filter(t => t.status === 'downloading');
         } else if (this.currentFilter === 'Completed') {
-            filtered = filtered.filter(t => t.status === 'completed' || t.progress >= 100);
+            filtered = filtered.filter(t => t.status === 'completed');
         }
         
         // Apply sorting
@@ -220,6 +209,7 @@ class TorrentClient {
         
         this.filteredTorrents = filtered;
         this.renderTorrents();
+        this.syncSelectedTorrent();
         this.updateGlobalStats();
     }
 
@@ -382,7 +372,7 @@ class TorrentClient {
             </div>
             <div class="progress-container">
                 <div class="progress-bar-wrapper">
-                    <div class="progress-bar ${t.progress >= 100 ? 'completed' : ''}" style="width: ${t.progress || 0}%"></div>
+                    <div class="progress-bar ${t.status === 'completed' ? 'completed' : ''}" style="width: ${t.progress || 0}%"></div>
                     <div class="progress-text">${(t.progress || 0).toFixed(1)}%</div>
                 </div>
             </div>
@@ -413,9 +403,20 @@ class TorrentClient {
         this.switchView('control-panel');
     }
 
+    syncSelectedTorrent() {
+        if (this.selectedTorrent) {
+            this.selectedTorrent = this.torrents.get(this.selectedTorrent.info_hash) || null;
+            this.renderControlPanel();
+        }
+    }
+
     renderControlPanel() {
         const container = document.getElementById('control-panel-view');
-        if (!container || !this.selectedTorrent) return;
+        if (!container) return;
+        if (!this.selectedTorrent) {
+            container.innerHTML = '<div class="empty-state"><p>Select a torrent to view details</p></div>';
+            return;
+        }
 
         const t = this.selectedTorrent;
         
