@@ -1,147 +1,155 @@
-
 import hashlib
+import os
 from pathlib import Path
+import tempfile
+import threading
+
+from .paths import safe_join
 
 
 class PieceManager:
     BLOCK_SIZE = 16384
-    def __init__(self, torrent, download_dir="downloads"): #PATH TO DOWNLOAD
+
+    def __init__(self, torrent, download_dir="downloads"):
         self.torrent = torrent
-        self.download_dir = Path(download_dir)
-        self.download_dir.mkdir(exist_ok=True)
-
+        self.download_dir = Path(download_dir).resolve()
+        self.download_dir.mkdir(parents=True, exist_ok=True)
         self.have_pieces = [False] * len(torrent.pieces)
-        self.piece_data = {} #bytes of pieces
+        self.piece_data = {}
         self.pending_blocks = {}
-    
-    def get_next_piece_to_download(self, peer): #checks
-        for piece_index in range(len(self.torrent.pieces)):
-            if self.have_pieces[piece_index]:
-                continue
-            if not peer.has_piece(piece_index):
-                continue
-            if piece_index in self.pending_blocks:
-                continue
-            return piece_index
+        self._lock = threading.RLock()
+
+    def get_next_piece_to_download(self, peer):
+        with self._lock:
+            for index in range(len(self.have_pieces)):
+                if not self.have_pieces[index] and index not in self.pending_blocks and peer.has_piece(index):
+                    return index
         return None
-    
+
+    def reserve_next_piece(self, peer):
+        # Selection and reservation must be atomic across peer workers.
+        with self._lock:
+            index = self.get_next_piece_to_download(peer)
+            if index is None:
+                return None
+            return index, self.init_piece_download(index)
+
     def init_piece_download(self, piece_index):
-        piece_length = self.get_piece_length(piece_index) #real length of piece
-        blocks = []
-        offset = 0
-        
-        while offset < piece_length: #creates blocks
-            block_length = min(self.BLOCK_SIZE, piece_length - offset) #if less 16KB, take the less
-            blocks.append((offset, block_length))
-            offset += block_length #offset, length
-        
-        self.pending_blocks[piece_index] = {offset: None for offset, _ in blocks} #dict for downloaded blocks
-        return blocks
-    
+        with self._lock:
+            if not 0 <= piece_index < len(self.have_pieces):
+                raise ValueError("Invalid piece index")
+            if self.have_pieces[piece_index] or piece_index in self.pending_blocks:
+                raise ValueError("Piece is already reserved or complete")
+            length = self.get_piece_length(piece_index)
+            blocks = [(offset, min(self.BLOCK_SIZE, length - offset))
+                      for offset in range(0, length, self.BLOCK_SIZE)]
+            self.pending_blocks[piece_index] = {offset: None for offset, _ in blocks}
+            return blocks
+
+    def abort_piece(self, piece_index):
+        with self._lock:
+            self.pending_blocks.pop(piece_index, None)
+
+    def has_pending(self):
+        with self._lock:
+            return bool(self.pending_blocks)
+
+    def has_piece(self, piece_index):
+        with self._lock:
+            return self.have_pieces[piece_index]
+
+    def get_bitfield(self):
+        with self._lock:
+            bitfield = bytearray((len(self.have_pieces) + 7) // 8)
+            for index, complete in enumerate(self.have_pieces):
+                if complete:
+                    bitfield[index // 8] |= 1 << (7 - index % 8)
+            return bytes(bitfield)
+
+    def needs_pieces_from(self, peer):
+        with self._lock:
+            return any(not complete and peer.has_piece(index)
+                       for index, complete in enumerate(self.have_pieces))
+
     def get_piece_length(self, piece_index):
-        if piece_index == len(self.torrent.pieces) - 1: #last piece
-            return self.torrent.total_size % self.torrent.piece_length or self.torrent.piece_length
-        else:
-            return self.torrent.piece_length
-    
+        return min(self.torrent.piece_length,
+                   self.torrent.total_size - piece_index * self.torrent.piece_length)
+
     def add_block(self, piece_index, block_offset, block_data):
-        if piece_index not in self.pending_blocks:
+        with self._lock:
+            blocks = self.pending_blocks.get(piece_index)
+            if blocks is None or block_offset not in blocks:
+                raise ValueError("Unrequested block")
+            expected = min(self.BLOCK_SIZE, self.get_piece_length(piece_index) - block_offset)
+            if len(block_data) != expected or blocks[block_offset] is not None:
+                raise ValueError("Invalid or duplicate block")
+            blocks[block_offset] = block_data
+            if all(value is not None for value in blocks.values()):
+                return self._complete_piece(piece_index)
             return False
-        
-        self.pending_blocks[piece_index][block_offset] = block_data
-        
-        if all(data is not None for data in self.pending_blocks[piece_index].values()):
-            return self._complete_piece(piece_index)
-        
-        return False
-    
+
     def _complete_piece(self, piece_index):
-        blocks = self.pending_blocks[piece_index] #dict
-        sorted_offsets = sorted(blocks.keys()) #sort
-        piece_data = b''.join(blocks[offset] for offset in sorted_offsets) #assemble
-
-        #check hash
-        piece_hash = hashlib.sha1(piece_data).digest()
-        expected_hash = self.torrent.pieces[piece_index]
-        
-        if piece_hash != expected_hash:
-            print(f"Piece {piece_index} HASH MISMATCH")
-            del self.pending_blocks[piece_index]
+        blocks = self.pending_blocks.pop(piece_index)
+        data = b''.join(blocks[offset] for offset in sorted(blocks))
+        if hashlib.sha1(data).digest() != self.torrent.pieces[piece_index]:
             return False
-
-        self.piece_data[piece_index] = piece_data
+        self.piece_data[piece_index] = data
         self.have_pieces[piece_index] = True
-        del self.pending_blocks[piece_index]
-        
-        print(f"Piece {piece_index} completed and verified.")
         return True
-    
+
     def get_progress(self):
-        completed = sum(self.have_pieces)
-        total = len(self.have_pieces)
-        percentage = (completed / total) * 100 if total > 0 else 0
-        
-        return {
-            'completed_pieces': completed,
-            'total_pieces': total,
-            'percentage': percentage,
-            'downloaded_bytes': sum(len(self.piece_data[i]) for i in self.piece_data),
-            'total_bytes': self.torrent.total_size
-        }
-    
-    def save_to_disk(self):
-        if not any(self.have_pieces):
-            print("No pieces to save")
-            return
+        with self._lock:
+            downloaded = sum(len(data) for data in self.piece_data.values())
+            total = self.torrent.total_size
+            return {
+                "completed_pieces": sum(self.have_pieces),
+                "total_pieces": len(self.have_pieces),
+                "percentage": 100 * downloaded / total if total else 100,
+                "downloaded_bytes": downloaded,
+                "total_bytes": total,
+            }
+
+    def save_to_disk(self, stop_event=None):
+        with self._lock:
+            if not all(self.have_pieces):
+                raise ValueError("Cannot save an incomplete torrent")
+            pieces = [memoryview(self.piece_data[index]) for index in range(len(self.have_pieces))]
 
         if self.torrent.is_multi_file:
-            self._save_multi_file()
+            files = [(safe_join(self.download_dir, self.torrent.name, *item["path"]), item["length"])
+                     for item in self.torrent.data["info"]["files"]]
         else:
-            self._save_single_file()
-    
-    def _save_single_file(self):
-        output_path = self.download_dir / self.torrent.name
+            files = [(safe_join(self.download_dir, self.torrent.name), self.torrent.total_size)]
 
-        print(f"\nSaving to: {output_path}")
-        
-        with open(output_path, 'wb') as f:
-            for piece_index in range(len(self.torrent.pieces)):
-                if piece_index in self.piece_data:
-                    f.write(self.piece_data[piece_index])
-        
-        print(f"Saved {sum(self.have_pieces)} pieces to disk")
-    
-    def _save_multi_file(self):
-        base_dir = self.download_dir / self.torrent.name
-        base_dir.mkdir(exist_ok=True)
-        
-        print(f"\nSaving multi-file torrent to: {base_dir}")
-
-        all_data = bytearray() #assemble all data
-        for piece_index in range(len(self.torrent.pieces)):
-            if piece_index in self.piece_data:
-                all_data.extend(self.piece_data[piece_index])
-        
-        #get file list from torrent info
-        files = self.torrent.data['info'].get('files', [])
-        
-        if not files:
-            print("Warning: Multi-file torrent but no files list found")
-            return
-
-        offset = 0
-        for file_info in files:
-            path_parts = file_info['path']
-
-            if isinstance(path_parts[0], bytes): #if path in bytes
-                path_parts = [p.decode('utf-8') for p in path_parts] #decode the path into string
-            file_path = base_dir / Path(*path_parts) #full path
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            length = file_info['length']
-            file_data = all_data[offset:offset + length] #Berem нужную часть общего массива данных
-
-            with open(file_path, 'wb') as f:
-                f.write(file_data)
-            print(f"Saved: {file_path.name} ({length} bytes)")
-            offset += length
+        # Preflight every destination before writing any output.
+        piece_index = piece_offset = 0
+        for destination, length in files:
+            if stop_event is not None and stop_event.is_set():
+                raise InterruptedError("Download stopped")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            relative = destination.relative_to(self.download_dir)
+            destination = safe_join(self.download_dir, *relative.parts)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".minitorrent-", delete=False) as output:
+                    temporary = Path(output.name)
+                    remaining = length
+                    while remaining:
+                        if stop_event is not None and stop_event.is_set():
+                            raise InterruptedError("Download stopped")
+                        piece = pieces[piece_index]
+                        count = min(remaining, len(piece) - piece_offset)
+                        output.write(piece[piece_offset:piece_offset + count])
+                        remaining -= count
+                        piece_offset += count
+                        if piece_offset == len(piece):
+                            piece_index += 1
+                            piece_offset = 0
+                if stop_event is not None and stop_event.is_set():
+                    raise InterruptedError("Download stopped")
+                safe_join(self.download_dir, *relative.parts)
+                os.replace(temporary, destination)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 

@@ -6,7 +6,9 @@ import os
 import socket
 import struct
 import requests
-from urllib.parse import urlencode, quote
+from urllib.parse import parse_qsl, urlencode, quote, urlsplit, urlunsplit
+
+from .bencode import BencodeDecoder
 
 
 class TrackerClient:
@@ -32,8 +34,11 @@ class TrackerClient:
         """
         tracker_url = self.torrent.announce
 
-        if not tracker_url.startswith(('http://', 'https://')): #check if tracker is supported
-            raise ValueError(f"Unsupported tracker protocol: {tracker_url}")
+        parts = urlsplit(tracker_url)
+        if parts.scheme not in {'http', 'https'} or not parts.hostname or parts.username or parts.password:
+            raise ValueError("Unsupported tracker URL")
+        if any(ord(char) < 32 for char in tracker_url):
+            raise ValueError("Invalid tracker URL")
 
         params = {
             'info_hash': self.torrent.info_hash,
@@ -45,40 +50,36 @@ class TrackerClient:
             'compact': 1, #compacting peer list
             'event': event
         }
-        query_string = self._build_query_string(params) #encode params for simplicit
-        full_url = f"{tracker_url}?{query_string}"
-
-        print(f"Connecting to tracker: {tracker_url}")
-        print(f"Info hash: {self.torrent.info_hash.hex()}")
-        print(f"Peer ID: {self.peer_id.hex()}")
+        existing = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+                    if key not in params]
+        query_string = urlencode(existing + list(params.items()), quote_via=quote, safe='')
+        full_url = urlunsplit((parts.scheme, parts.netloc, parts.path, query_string, ''))
 
         try:
-            response = requests.get(full_url, timeout=15)
-            response.raise_for_status()
-
-            from .bencode import BencodeDecoder
-            tracker_response = BencodeDecoder(response.content).decode()
+            with requests.get(full_url, timeout=(5, 15), stream=True) as response:
+                response.raise_for_status()
+                content = bytearray()
+                for chunk in response.iter_content(65536):
+                    content.extend(chunk)
+                    if len(content) > BencodeDecoder.MAX_SIZE:
+                        raise ValueError("Tracker response exceeds size limit")
+            tracker_response = BencodeDecoder(bytes(content)).decode()
+            if not isinstance(tracker_response, dict):
+                raise ValueError("Invalid tracker response")
 
             if b'failure reason' in tracker_response or 'failure reason' in tracker_response:
                 reason = tracker_response.get(b'failure reason') or tracker_response.get('failure reason')
                 if isinstance(reason, bytes):
                     reason = reason.decode('utf-8')
-                raise Exception(f"Tracker error: {reason}")
+                raise ValueError("Tracker rejected the announce request")
 
             return tracker_response
 
         except requests.RequestException as e:
-            raise Exception(f"Failed connection to tracker: {e}")
+            raise ConnectionError("Failed connection to tracker") from e
 
     def _build_query_string(self, params): #query
-        parts = []
-        for key, value in params.items():
-            if isinstance(value, bytes): #if value is bytes then:
-                encoded_value = quote(value, safe='') #coded to url
-            else:
-                encoded_value = str(value)
-            parts.append(f"{key}={encoded_value}")
-        return '&'.join(parts)
+        return urlencode(params, quote_via=quote, safe='')
 
     def get_peers(self):
         response = self.announce()
@@ -98,17 +99,23 @@ class TrackerClient:
 
         if isinstance(peers_data, list): #dictionary with list of ip,port
             for peer in peers_data:
+                if not isinstance(peer, dict):
+                    raise ValueError("Invalid peer entry")
                 ip = peer.get(b'ip') or peer.get('ip')
                 port = peer.get(b'port') or peer.get('port')
 
                 if isinstance(ip, bytes):
                     ip = ip.decode('utf-8')
-
+                socket.inet_aton(ip)
+                if type(port) is not int or not 0 < port < 65536:
+                    raise ValueError("Invalid peer port")
                 peers.append((ip, port))
             return peers
 
         if isinstance(peers_data, bytes):
             peer_size = 6  #4 IP, 2 port
+            if len(peers_data) % peer_size:
+                raise ValueError("Truncated peer list")
             for i in range(0, len(peers_data), peer_size):
                 chunk = peers_data[i:i + peer_size]
 

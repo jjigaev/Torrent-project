@@ -1,68 +1,84 @@
 import struct
+import threading
+import time
+
 from .piece_manager import PieceManager
 
 
 class Downloader:
     MAX_INFLIGHT_PER_PEER = 10
-    
-    def __init__(self, torrent, peers):
+    BLOCK_TIMEOUT = 15
+
+    def __init__(self, torrent, peers, piece_manager=None, stop_event=None):
         self.torrent = torrent
         self.peers = peers
-        self.piece_manager = PieceManager(torrent)
-        self.peer_inflight = {peer: 0 for peer in peers} #dict for peer requests
-    
-    def download_piece(self, peer, piece_index):
-        blocks = self.piece_manager.init_piece_download(piece_index) #16KB
-        total_blocks = len(blocks)
-        requested = 0
-        received = 0
-        block_queue = list(blocks)
-        
-        while received < total_blocks:
-            while requested < total_blocks and self.peer_inflight[peer] < self.MAX_INFLIGHT_PER_PEER:
-                block_offset, block_length = block_queue[requested]
-                peer.request_piece(piece_index, block_offset, block_length) #sending request
-                self.peer_inflight[peer] += 1
-                requested += 1
-            
-            msg = peer.receive_message(timeout=15) #vazno
-            
-            if msg is None:
-                return False
-            
-            msg_type, payload = msg
-            
-            if msg_type == 7: #PIECE
-                index = struct.unpack(">I", payload[0:4])[0] #index(4)
-                begin = struct.unpack(">I", payload[4:8])[0] #begin(4)
-                block_data = payload[8:] #variable
-                
-                if index != piece_index:
+        self.piece_manager = piece_manager if piece_manager is not None else PieceManager(torrent)
+        self.stop_event = stop_event if stop_event is not None else threading.Event()
+        self.peer_inflight = {peer: 0 for peer in peers}
+
+    def download_piece(self, peer, piece_index, blocks=None):
+        if blocks is None:
+            blocks = self.piece_manager.init_piece_download(piece_index)
+        outstanding = {}
+        requested = received = 0
+        deadline = time.monotonic() + self.BLOCK_TIMEOUT
+        try:
+            while received < len(blocks):
+                if self.stop_event.is_set() or time.monotonic() >= deadline:
+                    return False
+                while requested < len(blocks) and len(outstanding) < self.MAX_INFLIGHT_PER_PEER:
+                    offset, length = blocks[requested]
+                    peer.request_piece(piece_index, offset, length)
+                    outstanding[offset] = length
+                    requested += 1
+                self.peer_inflight[peer] = len(outstanding)
+                message = peer.receive_message(timeout=max(0.01, deadline - time.monotonic()))
+                if message is None:
+                    return False
+                message_type, payload = message
+                if message_type == 0:
+                    return False
+                if message_type != 7:
                     continue
-                
-                self.piece_manager.add_block(piece_index, begin, block_data) #add to piecemanager
-                self.peer_inflight[peer] -= 1
+                if len(payload) < 8:
+                    return False
+                index, begin = struct.unpack(">II", payload[:8])
+                block = payload[8:]
+                if index != piece_index:
+                    return False
+                if begin not in outstanding:
+                    # A repeated response must not count as a new block.
+                    continue
+                if len(block) != outstanding[begin]:
+                    return False
+                self.piece_manager.add_block(piece_index, begin, block)
+                del outstanding[begin]
+                self.peer_inflight[peer] = len(outstanding)
                 received += 1
-                
-            elif msg_type == 0:
+                deadline = time.monotonic() + self.BLOCK_TIMEOUT
+            if not self.piece_manager.has_piece(piece_index):
                 return False
-        
-        return self.piece_manager.have_pieces[piece_index]
-    
+            # Super-seeding peers may wait for HAVE before offering more data.
+            # Announce only after SHA-1 verification, to every connected peer.
+            for target in self.peers:
+                try:
+                    target.send_have(piece_index)
+                except OSError:
+                    # A closed observer must not discard an already valid piece.
+                    pass
+            return True
+        except (OSError, ValueError, struct.error):
+            return False
+        finally:
+            self.peer_inflight[peer] = 0
+            self.piece_manager.abort_piece(piece_index)
+
     def download_pieces(self, num_pieces=5):
-        pieces_downloaded = 0
-        
+        downloaded = 0
         for peer in self.peers:
-            if pieces_downloaded >= num_pieces:
+            if downloaded >= num_pieces or self.stop_event.is_set():
                 break
-            
-            piece_index = self.piece_manager.get_next_piece_to_download(peer)
-            
-            if piece_index is None:
-                continue
-            
-            if self.download_piece(peer, piece_index):
-                pieces_downloaded += 1
-                progress = self.piece_manager.get_progress()
-        
-        return pieces_downloaded
+            reservation = self.piece_manager.reserve_next_piece(peer)
+            if reservation is not None and self.download_piece(peer, *reservation):
+                downloaded += 1
+        return downloaded

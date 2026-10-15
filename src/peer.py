@@ -8,7 +8,7 @@ Also handles bitfield to get pieces from other peers
 
 import socket
 import struct
-import time
+import threading
 from enum import IntEnum
 
 class MessageType(IntEnum):
@@ -24,6 +24,8 @@ class MessageType(IntEnum):
 
 
 class PeerConnection:
+    MAX_MESSAGE_LENGTH = 1024 * 1024
+
     def __init__(self, ip, port, info_hash, peer_id):
         self.ip = ip
         self.port = port
@@ -37,6 +39,8 @@ class PeerConnection:
         self.peer_choking = True
         self.peer_interested = False
         self.peer_pieces = set()  #which peer has piece
+        self._receive_buffer = bytearray()
+        self._send_lock = threading.Lock()
 
     def connect(self, timeout=5): #TCP peer connection
         try:
@@ -46,12 +50,12 @@ class PeerConnection:
             self.connected = True
             return True
         except (socket.timeout, ConnectionRefusedError, OSError) as e:
-            self.connected = False
+            self.close()
             return False
 
     def handshake(self):
         if not self.connected:
-            raise Exception("Not connected to peer")
+            raise ConnectionError("Not connected to peer")
 
         pstr = b"BitTorrent protocol"
         pstrlen = 19
@@ -65,12 +69,12 @@ class PeerConnection:
                 self.peer_id
         )
 
-        self.socket.send(handshake_msg)
+        self.socket.sendall(handshake_msg)
 
         response = self._recv_exactly(68)
 
         if len(response) < 68:
-            raise Exception("Invalid handshake response length")
+            raise ValueError("Invalid handshake response length")
 
         recv_pstrlen = response[0]
         recv_pstr = response[1:20]
@@ -79,25 +83,26 @@ class PeerConnection:
         recv_peer_id = response[48:68]
 
         #validation checks from malicious peers
-        if recv_pstr != pstr:
-            raise Exception(f"Invalid protocol: {recv_pstr}")
+        if recv_pstrlen != pstrlen or recv_pstr != pstr:
+            raise ValueError("Invalid peer protocol")
 
         if recv_info_hash != self.info_hash:
-            raise Exception("Info hash mismatch")
+            raise ValueError("Info hash mismatch")
 
         return True
 
     def _recv_exactly(self, n): #receive exactly n bytes from TCP-socket
-        data = b'' #byte buffer
-        while len(data) < n:
-            try:
-                chunk = self.socket.recv(n - len(data))
-                if not chunk:
-                    raise Exception("Connection closed by peer")
-                data += chunk
-            except socket.timeout:
-                raise Exception("timed out")
+        self._buffer_until(n)
+        data = bytes(self._receive_buffer[:n])
+        del self._receive_buffer[:n]
         return data
+
+    def _buffer_until(self, length):
+        while len(self._receive_buffer) < length:
+            chunk = self.socket.recv(length - len(self._receive_buffer))
+            if not chunk:
+                raise ConnectionError("Connection closed by peer")
+            self._receive_buffer.extend(chunk)
 
     def send_interested(self):
         self._send_message(MessageType.INTERESTED)
@@ -115,26 +120,39 @@ class PeerConnection:
         self._send_message(MessageType.CHOKE)
         self.am_choking = True
 
+    def send_have(self, piece_index):
+        self._send_message(MessageType.HAVE, struct.pack(">I", piece_index))
+
+    def send_bitfield(self, bitfield):
+        self._send_message(MessageType.BITFIELD, bitfield)
+
     def _send_message(self, message_type, payload=b''):
         length = 1 + len(payload)
         message = struct.pack(">I", length) + struct.pack("B", message_type) + payload
-        self.socket.send(message)
+        # HAVE broadcasts can share this socket with its download worker.
+        with self._send_lock:
+            self.socket.sendall(message)
 
     def receive_message(self, timeout=5):
         self.socket.settimeout(timeout)
 
         try:
-            length_data = self._recv_exactly(4)
-            length = struct.unpack(">I", length_data)[0]
+            # Consume a frame only after it is complete. A socket timeout can
+            # happen halfway through its header or payload; keep those bytes
+            # for the next receive instead of losing framing synchronization.
+            self._buffer_until(4)
+            length = struct.unpack(">I", self._receive_buffer[:4])[0]
+            if length > self.MAX_MESSAGE_LENGTH:
+                raise ValueError("Peer message exceeds size limit")
 
             if length == 0:
+                del self._receive_buffer[:4]
                 return (None, b'')
 
-            message_id = self._recv_exactly(1)[0] #takes 1st byte
-
-            payload = b''
-            if length > 1:
-                payload = self._recv_exactly(length - 1) #without id
+            self._buffer_until(4 + length)
+            message_id = self._receive_buffer[4]
+            payload = bytes(self._receive_buffer[5:4 + length])
+            del self._receive_buffer[:4 + length]
 
             if message_id == MessageType.CHOKE:
                 self.peer_choking = True
@@ -146,6 +164,10 @@ class PeerConnection:
                 self.peer_interested = False
             elif message_id == MessageType.BITFIELD:
                 self._handle_bitfield(payload)
+            elif message_id == MessageType.HAVE:
+                if len(payload) != 4:
+                    raise ValueError("Invalid HAVE message")
+                self.peer_pieces.add(struct.unpack(">I", payload)[0])
 
             return (message_id, payload)
 
@@ -171,8 +193,12 @@ class PeerConnection:
     def close(self):
         if self.socket:
             try:
+                self.socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
                 self.socket.close()
-            except:
+            except OSError:
                 pass
         self.connected = False
 
