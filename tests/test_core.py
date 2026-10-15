@@ -7,6 +7,7 @@ import struct
 import tempfile
 import threading
 import time
+import tracemalloc
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -93,7 +94,9 @@ class PieceTests(unittest.TestCase):
         self.directory = Path(self.scratch.name)
 
     def manager(self, raw=None):
-        return PieceManager(TorrentFile.from_bytes(raw or torrent_bytes()), self.directory / "downloads")
+        manager = PieceManager(TorrentFile.from_bytes(raw or torrent_bytes()), self.directory / "downloads")
+        self.addCleanup(manager.close)
+        return manager
 
     def complete(self, manager, payload=b"ABCD"):
         for index in range(len(manager.have_pieces)):
@@ -194,6 +197,22 @@ class PieceTests(unittest.TestCase):
         self.assertEqual(observer.announced_pieces, [0])
         disconnected.send_have.assert_called_once_with(0)
 
+    def test_new_peer_catches_up_pieces_finished_during_negotiation(self):
+        manager = self.manager(torrent_bytes(payload=b"ABCDEFGH"))
+        manager.init_piece_download(0)
+        manager.add_block(0, 0, b"ABCD")
+        downloader = Downloader(manager.torrent, [], piece_manager=manager)
+        late, informed, disconnected = FakePeer(), FakePeer(), FakePeer()
+        informed.sent_bitfield = b"\x80"
+        disconnected.send_have = Mock(side_effect=ConnectionError("closed"))
+        self.assertTrue(downloader.add_peer(late))
+        self.assertEqual(late.announced_pieces, [0])
+        self.assertTrue(downloader.add_peer(informed))
+        self.assertEqual(informed.announced_pieces, [])
+        self.assertFalse(downloader.add_peer(disconnected))
+        self.assertTrue(disconnected.closed)
+        self.assertNotIn(disconnected, downloader.snapshot_peers())
+
     def test_bitfield_contains_only_verified_pieces_and_zero_padding(self):
         manager = self.manager(torrent_bytes(payload=b"A" * 36))
         self.assertEqual(manager.get_bitfield(), b"\x00\x00")
@@ -223,11 +242,50 @@ class PieceTests(unittest.TestCase):
             peer = FakePeer()
             peer.receive_message = Mock(return_value=message)
             downloader = Downloader(manager.torrent, [peer], piece_manager=manager)
-            with self.subTest(message=message):
+            with self.subTest(message=message), patch.object(Downloader, "CHOKE_TIMEOUT", 0.01):
                 self.assertFalse(downloader.download_piece(peer, 0))
                 self.assertFalse(manager.has_pending())
                 self.assertFalse(manager.has_piece(0))
                 self.assertFalse(peer.announced_pieces)
+
+    def test_choke_reissues_only_missing_blocks_and_ignores_duplicates(self):
+        payload = b"A" * PieceManager.BLOCK_SIZE + b"Z"
+        manager = self.manager(torrent_bytes(payload=payload, piece_length=len(payload)))
+        peer = FakePeer()
+        first = (7, struct.pack(">II", 0, 0) + payload[:-1])
+        last = (7, struct.pack(">II", 0, PieceManager.BLOCK_SIZE) + b"Z")
+        peer.receive_message = Mock(side_effect=[first, (0, b""), (1, b""), first, last])
+        downloader = Downloader(manager.torrent, [peer], piece_manager=manager)
+        self.assertTrue(downloader.download_piece(peer, 0))
+        self.assertEqual(peer.requests, [(0, 0, PieceManager.BLOCK_SIZE), (0, PieceManager.BLOCK_SIZE, 1),
+                                        (0, PieceManager.BLOCK_SIZE, 1)])
+        self.assertEqual(manager.get_progress()["downloaded_bytes"], len(payload))
+        self.assertFalse(manager.has_pending())
+
+    def test_repeated_choke_is_bounded_and_stop_while_choked_is_prompt(self):
+        for cancel in [False, True]:
+            manager = self.manager()
+            peer = FakePeer()
+            stop = threading.Event()
+            clock = [0]
+
+            def monotonic():
+                clock[0] += 1
+                return clock[0]
+
+            def receive(**kwargs):
+                if cancel:
+                    stop.set()
+                return 0, b""
+
+            peer.receive_message = Mock(side_effect=receive)
+            downloader = Downloader(manager.torrent, [peer], piece_manager=manager, stop_event=stop)
+            with patch("src.downloader.time", SimpleNamespace(monotonic=monotonic)), \
+                    patch.object(Downloader, "CHOKE_TIMEOUT", 5):
+                self.assertFalse(downloader.download_piece(peer, 0))
+            self.assertLess(peer.receive_message.call_count, 10)
+            self.assertFalse(manager.has_pending())
+            self.assertEqual(downloader.peer_inflight[peer], 0)
 
     def test_duplicate_blocks_do_not_count_as_progress(self):
         payload = b"A" * (PieceManager.BLOCK_SIZE + 1)
@@ -256,6 +314,111 @@ class PieceTests(unittest.TestCase):
         manager = self.manager(torrent_bytes(payload=b""))
         manager.save_to_disk()
         self.assertEqual((manager.download_dir / "data.bin").read_bytes(), b"")
+
+    def test_large_torrent_is_saved_with_bounded_memory_and_releases_storage(self):
+        piece_length, count = 1024 * 1024, 32
+        block = b"A" * PieceManager.BLOCK_SIZE
+        digest = hashlib.sha1(block * (piece_length // len(block))).digest()
+        raw = BencodeEncoder.encode({"announce": b"https://tracker.invalid/announce", "info": {
+            "name": b"large.bin", "piece length": piece_length, "length": piece_length * count,
+            "pieces": digest * count}})
+        tracemalloc.start()
+        try:
+            manager = self.manager(raw)
+            for index in range(count):
+                for offset, length in manager.init_piece_download(index):
+                    manager.add_block(index, offset, block[:length])
+            self.assertEqual(manager.get_progress()["downloaded_bytes"], piece_length * count)
+            self.assertEqual(manager.read_verified_block(count - 1, 0, len(block)), block)
+            manager.save_to_disk()
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 8 * 1024 * 1024)
+        self.assertTrue(manager.closed)
+        with (manager.download_dir / "large.bin").open("rb") as saved:
+            for _ in range(count):
+                self.assertEqual(hashlib.sha1(saved.read(piece_length)).digest(), digest)
+            self.assertEqual(saved.read(1), b"")
+        self.assertEqual(list(manager.download_dir.glob(".minitorrent-*")), [])
+
+    def test_pending_piece_budget_is_bounded(self):
+        manager = self.manager(torrent_bytes(payload=b"A" * 84))
+        for _ in range(manager.MAX_PENDING_PIECES):
+            self.assertIsNotNone(manager.reserve_next_piece(FakePeer()))
+        self.assertIsNone(manager.reserve_next_piece(FakePeer()))
+        manager.abort_piece(0)
+        self.assertIsNotNone(manager.reserve_next_piece(FakePeer()))
+
+    def test_out_of_order_pieces_do_not_create_holes_and_assemble_in_torrent_order(self):
+        payload = b"AAAABBBBCCCC"
+        manager = self.manager(torrent_bytes(payload=payload))
+        for index in [2, 0, 1]:
+            manager.init_piece_download(index)
+            manager.add_block(index, 0, payload[index * 4:index * 4 + 4])
+            manager._storage.flush()
+            self.assertEqual(os.fstat(manager._storage.fileno()).st_size,
+                             manager.get_progress()["downloaded_bytes"])
+        manager.save_to_disk()
+        self.assertEqual((manager.download_dir / "data.bin").read_bytes(), payload)
+
+    def test_short_block_write_is_not_marked_verified(self):
+        manager = self.manager()
+        manager.init_piece_download(0)
+        with patch.object(manager._storage, "write", return_value=1):
+            with self.assertRaises(OSError):
+                manager.add_block(0, 0, b"ABCD")
+        self.assertFalse(manager.has_piece(0))
+        self.assertEqual(manager.get_progress()["downloaded_bytes"], 0)
+
+    def test_unverified_disk_blocks_cannot_be_read_and_failed_hash_is_retryable(self):
+        manager = self.manager()
+        manager.init_piece_download(0)
+        self.assertFalse(manager.add_block(0, 0, b"BAD!"))
+        with self.assertRaises(ValueError):
+            manager.read_verified_block(0, 0, 4)
+        manager.init_piece_download(0)
+        self.assertTrue(manager.add_block(0, 0, b"ABCD"))
+        self.assertEqual(manager.read_verified_block(0, 0, 4), b"ABCD")
+
+    def test_disk_failure_preserves_existing_output_and_allows_save_retry(self):
+        manager = self.manager()
+        self.complete(manager)
+        target = manager.download_dir / "data.bin"
+        target.write_bytes(b"original")
+        with patch("src.piece_manager.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                manager.save_to_disk()
+        self.assertEqual(target.read_bytes(), b"original")
+        self.assertFalse(manager.closed)
+        self.assertEqual(list(manager.download_dir.glob(".minitorrent-*")),
+                         [Path(manager._storage.name)] if isinstance(manager._storage.name, str) else [])
+        manager.save_to_disk()
+        self.assertEqual(target.read_bytes(), b"ABCD")
+        self.assertTrue(manager.closed)
+
+    def test_cancel_during_disk_copy_preserves_output_and_can_resume_save(self):
+        payload = b"A" * (PieceManager.COPY_SIZE + 1)
+        manager = self.manager(torrent_bytes(payload=payload, piece_length=len(payload)))
+        self.complete(manager, payload)
+        target = manager.download_dir / "data.bin"
+        target.write_bytes(b"original")
+        stop = threading.Event()
+        read = manager._read_at
+
+        def cancel_after_read(offset, length):
+            content = read(offset, length)
+            stop.set()
+            return content
+
+        with patch.object(manager, "_read_at", side_effect=cancel_after_read):
+            with self.assertRaises(InterruptedError):
+                manager.save_to_disk(stop_event=stop)
+        self.assertEqual(target.read_bytes(), b"original")
+        self.assertFalse(manager.closed)
+        stop.clear()
+        manager.save_to_disk(stop_event=stop)
+        self.assertEqual(target.read_bytes(), payload)
 
 
 class TrackerTests(unittest.TestCase):
@@ -296,8 +459,8 @@ class TrackerTests(unittest.TestCase):
 
 
 class PeerTests(unittest.TestCase):
-    def peer(self, data=b""):
-        peer = PeerConnection("127.0.0.1", 6881, b"i" * 20, b"p" * 20)
+    def peer(self, data=b"", piece_count=10):
+        peer = PeerConnection("127.0.0.1", 6881, b"i" * 20, b"p" * 20, piece_count)
         peer.socket = Mock()
         chunks = bytearray(data)
 
@@ -344,6 +507,24 @@ class PeerTests(unittest.TestCase):
         peer = self.peer(struct.pack(">IBI", 5, 4, 9))
         peer.receive_message()
         self.assertTrue(peer.has_piece(9))
+
+    def test_bitfield_is_bounded_before_payload_read(self):
+        peer = self.peer(struct.pack(">IB", 1025, 5), piece_count=1)
+        with self.assertRaises(ValueError):
+            peer.receive_message()
+        self.assertEqual(peer.socket.recv.call_count, 2)
+        self.assertFalse(peer.peer_pieces)
+
+    def test_bitfield_padding_and_have_indices_are_validated(self):
+        for frame in [struct.pack(">IB", 2, 5) + b"\xff", struct.pack(">IBI", 5, 4, 1),
+                      struct.pack(">IBI", 5, 4, 2**32 - 1)]:
+            peer = self.peer(frame, piece_count=1)
+            with self.subTest(frame=frame), self.assertRaises(ValueError):
+                peer.receive_message()
+            self.assertFalse(peer.peer_pieces)
+        peer = self.peer(struct.pack(">IB", 3, 5) + b"\x80\x40", piece_count=10)
+        peer.receive_message()
+        self.assertEqual(peer.peer_pieces, {0, 9})
 
     def test_have_and_bitfield_are_encoded_as_protocol_frames(self):
         peer = self.peer()

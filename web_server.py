@@ -78,12 +78,18 @@ async def _stop_download(data):
         await asyncio.shield(task)
 
 
+async def _dispose_download(data):
+    await _stop_download(data)
+    if data["piece_manager"] is not None:
+        await asyncio.to_thread(data["piece_manager"].close)
+
+
 @asynccontextmanager
 async def lifespan(app):
     try:
         yield
     finally:
-        await asyncio.gather(*(_stop_download(data) for data in tuple(active_torrents.values())))
+        await asyncio.gather(*(_dispose_download(data) for data in tuple(active_torrents.values())))
 
 
 app = FastAPI(title="MiniTorrentAPI", lifespan=lifespan)
@@ -274,7 +280,7 @@ async def delete_torrent(info_hash: str):
     async with data["lock"]:
         _check_current(info_hash, data)
         data["status"] = "paused"
-        await _stop_download(data)
+        await _dispose_download(data)
         del active_torrents[info_hash]
         await manager.broadcast({"type": "torrent_removed", "info_hash": info_hash})
     return {"success": True}
@@ -298,19 +304,23 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
-def try_connect_peer_sync(ip, port, info_hash, peer_id, data):
-    peer = PeerConnection(ip, port, info_hash, peer_id)
+def try_connect_peer_sync(ip, port, info_hash, peer_id, data, cancel_event=None):
+    peer = PeerConnection(ip, port, info_hash, peer_id, data["piece_count"])
     ready = False
+
+    def stopped():
+        return data["stop_event"].is_set() or (cancel_event is not None and cancel_event.is_set())
+
     with data["connections_lock"]:
         data["connections"].add(peer)
     try:
-        if data["stop_event"].is_set() or not peer.connect(timeout=1):
+        if stopped() or not peer.connect(timeout=1) or stopped():
             return None
         peer.handshake()
         peer.send_bitfield(data["piece_manager"].get_bitfield())
         peer.send_interested()
         deadline = time.monotonic() + PEER_READY_TIMEOUT
-        while not data["stop_event"].is_set():
+        while not stopped():
             if not peer.peer_choking and peer.peer_pieces:
                 ready = True
                 return peer
@@ -322,7 +332,7 @@ def try_connect_peer_sync(ip, port, info_hash, peer_id, data):
     except (OSError, ValueError):
         return None
     finally:
-        if data["stop_event"].is_set() or not ready:
+        if stopped() or not ready:
             peer.close()
             with data["connections_lock"]:
                 data["connections"].discard(peer)
@@ -342,23 +352,8 @@ def _download_sync(data):
             peers_list = tracker.get_peers()
             if stop.is_set():
                 return False
-            with ThreadPoolExecutor(max_workers=20) as executor:
-                futures = [executor.submit(try_connect_peer_sync, ip, port, torrent.info_hash,
-                                           tracker.peer_id, data) for ip, port in peers_list[:50]]
-                peers = []
-                for future in as_completed(futures):
-                    peer = future.result()
-                    if peer is not None:
-                        if len(peers) < 20 and not stop.is_set():
-                            peers.append(peer)
-                        else:
-                            peer.close()
-            if stop.is_set():
-                return False
-            if not peers:
-                raise ConnectionError("No available peers")
-            data["peers_connected"] = len(peers)
-            downloader = Downloader(torrent, peers, piece_manager=pieces, stop_event=stop)
+            downloader = Downloader(torrent, [], piece_manager=pieces, stop_event=stop)
+            negotiation_stop = threading.Event()
 
             def worker(peer):
                 idle_deadline = time.monotonic() + PEER_IDLE_TIMEOUT
@@ -394,10 +389,36 @@ def _download_sync(data):
                         idle_deadline = time.monotonic() + PEER_IDLE_TIMEOUT
                 finally:
                     peer.close()
+                    downloader.remove_peer(peer)
+                    with data["connections_lock"]:
+                        data["connections"].discard(peer)
+                        data["peers_connected"] -= 1
+                    if pieces.get_progress()["percentage"] >= 100:
+                        negotiation_stop.set()
+                        _close_connections(data)
 
-            with ThreadPoolExecutor(max_workers=len(peers)) as executor:
-                futures = [executor.submit(worker, peer) for peer in peers]
-                for future in futures:
+            with ThreadPoolExecutor(max_workers=20) as connecting, ThreadPoolExecutor(max_workers=20) as workers:
+                connections = [connecting.submit(try_connect_peer_sync, ip, port, torrent.info_hash,
+                                                  tracker.peer_id, data, negotiation_stop)
+                               for ip, port in peers_list[:50]]
+                downloads = []
+                for future in as_completed(connections):
+                    peer = future.result()
+                    if peer is None:
+                        continue
+                    if stop.is_set() or negotiation_stop.is_set() or sum(not job.done() for job in downloads) >= 20:
+                        peer.close()
+                        with data["connections_lock"]:
+                            data["connections"].discard(peer)
+                        continue
+                    if not downloader.add_peer(peer):
+                        with data["connections_lock"]:
+                            data["connections"].discard(peer)
+                        continue
+                    with data["connections_lock"]:
+                        data["peers_connected"] += 1
+                    downloads.append(workers.submit(worker, peer))
+                for future in downloads:
                     future.result()
         if stop.is_set():
             return False
@@ -415,10 +436,11 @@ async def download_torrent_threading(info_hash: str):
     data = active_torrents.get(info_hash)
     if data is None:
         return
-    worker = asyncio.create_task(asyncio.to_thread(_download_sync, data))
     loop = asyncio.get_running_loop()
     previous_time = loop.time()
-    previous_bytes = 0
+    pieces = data["piece_manager"]
+    previous_bytes = pieces.get_progress()["downloaded_bytes"] if pieces is not None else 0
+    worker = asyncio.create_task(asyncio.to_thread(_download_sync, data))
     try:
         while not worker.done():
             done, _ = await asyncio.wait({worker}, timeout=0.2)

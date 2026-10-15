@@ -1,6 +1,8 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 from pathlib import Path
+import socket
 import struct
 import tempfile
 import threading
@@ -13,7 +15,8 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import web_server as server
-from tests.helpers import FakePeer, torrent_bytes
+from src.piece_manager import PieceManager
+from tests.helpers import FakePeer, serve_seed, torrent_bytes
 
 
 class ApiTests(unittest.IsolatedAsyncioTestCase):
@@ -31,7 +34,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         for data in tuple(server.active_torrents.values()):
-            await server._stop_download(data)
+            await server._dispose_download(data)
         server.active_torrents.clear()
         await self.client.aclose()
         for item in reversed(self.patches):
@@ -53,7 +56,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         tracker = SimpleNamespace(peer_id=b"p" * 20, get_peers=lambda: [("127.0.0.1", 6881)])
 
         def connect(*args):
-            data = args[-1]
+            data = args[4]
             with data["connections_lock"]:
                 data["connections"].add(peer)
             return peer
@@ -200,13 +203,15 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         with tracker_patch, peer_patch:
             await self.client.post(f"/api/torrents/{info_hash}/start", headers=self.headers)
             await self.wait_until(peer.entered.is_set)
-            task = server.active_torrents[info_hash]["task"]
+            data = server.active_torrents[info_hash]
+            task = data["task"]
             response = await self.client.delete(f"/api/torrents/{info_hash}", headers=self.headers)
             self.assertEqual(response.status_code, 200)
             self.assertTrue(task.done())
             self.assertTrue(peer.closed)
             self.assertNotIn(info_hash, server.active_torrents)
             self.assertFalse((server.DOWNLOAD_DIR / "data.bin").exists())
+            self.assertTrue(data["piece_manager"].closed)
 
     async def test_success_marks_completed_only_after_file_is_saved(self):
         info_hash = (await self.add()).json()["info_hash"]
@@ -220,6 +225,126 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((server.DOWNLOAD_DIR / "data.bin").read_bytes(), b"ABCD")
         self.assertEqual(data["download_speed"], 0)
         self.assertTrue(peer.closed)
+
+    async def test_ready_peer_starts_while_slow_peer_waits_and_both_are_cleaned_up(self):
+        for complete in [False, True]:
+            raw = torrent_bytes(name=f"case-{complete}.bin".encode())
+            info_hash = (await self.add(raw)).json()["info_hash"]
+            good, slow = FakePeer(block=True), FakePeer(block=True)
+            slow_entered = threading.Event()
+            tracker = SimpleNamespace(peer_id=b"p" * 20,
+                                      get_peers=lambda: [("127.0.0.1", 1), ("127.0.0.1", 2)])
+
+            def connect(ip, port, digest, peer_id, data, cancel_event):
+                peer = good if port == 1 else slow
+                with data["connections_lock"]:
+                    data["connections"].add(peer)
+                if port == 1:
+                    if not slow_entered.wait(2):
+                        raise TimeoutError("Slow test peer did not enter")
+                    return good
+                slow_entered.set()
+                if not slow.release.wait(3):
+                    raise TimeoutError("Slow test peer was not closed")
+                with data["connections_lock"]:
+                    data["connections"].discard(slow)
+                return None
+
+            with patch.object(server, "TrackerClient", return_value=tracker), \
+                    patch.object(server, "try_connect_peer_sync", side_effect=connect):
+                try:
+                    await self.client.post(f"/api/torrents/{info_hash}/start", headers=self.headers)
+                    await self.wait_until(good.entered.is_set)
+                    self.assertFalse(slow.release.is_set())
+                    data = server.active_torrents[info_hash]
+                    self.assertEqual(data["peers_connected"], 1)
+                    if complete:
+                        good.release.set()
+                        await asyncio.wait_for(data["task"], 2)
+                        self.assertEqual(data["status"], "completed")
+                    else:
+                        response = await self.client.post(f"/api/torrents/{info_hash}/pause", headers=self.headers)
+                        self.assertEqual(response.status_code, 200)
+                        self.assertEqual(data["status"], "paused")
+                    self.assertTrue(data["task"].done())
+                    self.assertTrue(good.closed and slow.closed)
+                    self.assertFalse(data["connections"])
+                    self.assertEqual(data["peers_connected"], 0)
+                    self.assertEqual(data["piece_manager"].closed, complete)
+                finally:
+                    good.close()
+                    slow.close()
+
+    async def test_resume_does_not_report_retained_bytes_as_new_speed(self):
+        info_hash = (await self.add(torrent_bytes(payload=b"ABCDEFGH"))).json()["info_hash"]
+        data = server.active_torrents[info_hash]
+        pieces = PieceManager(data["torrent"], server.DOWNLOAD_DIR)
+        data["piece_manager"] = pieces
+        pieces.init_piece_download(0)
+        pieces.add_block(0, 0, b"ABCD")
+        peer = FakePeer(payload=b"ABCDEFGH", block=True)
+        tracker_patch, peer_patch = self.mock_network(peer)
+        with tracker_patch, peer_patch:
+            await self.client.post(f"/api/torrents/{info_hash}/start", headers=self.headers)
+            await self.wait_until(peer.entered.is_set)
+            await self.wait_until(lambda: data["downloaded_pieces"] == 1)
+            self.assertEqual(data["download_speed"], 0)
+            self.assertEqual(pieces.get_progress()["downloaded_bytes"], 4)
+            await self.client.post(f"/api/torrents/{info_hash}/pause", headers=self.headers)
+        self.assertFalse(pieces.closed)
+        self.assertEqual(pieces.read_verified_block(0, 0, 4), b"ABCD")
+        next_peer = FakePeer(payload=b"ABCDEFGH")
+        tracker_patch, peer_patch = self.mock_network(next_peer)
+        with tracker_patch, peer_patch:
+            await self.client.post(f"/api/torrents/{info_hash}/start", headers=self.headers)
+            await asyncio.wait_for(data["task"], 2)
+        self.assertEqual(data["status"], "completed")
+        self.assertEqual((server.DOWNLOAD_DIR / "data.bin").read_bytes(), b"ABCDEFGH")
+
+    async def test_save_failure_at_full_progress_can_retry_without_redownloading(self):
+        info_hash = (await self.add()).json()["info_hash"]
+        server.DOWNLOAD_DIR.mkdir()
+        target = server.DOWNLOAD_DIR / "data.bin"
+        target.write_bytes(b"original")
+        tracker_patch, peer_patch = self.mock_network(FakePeer())
+        with tracker_patch, peer_patch, patch("src.piece_manager.os.replace", side_effect=OSError("disk full")):
+            await self.client.post(f"/api/torrents/{info_hash}/start", headers=self.headers)
+            data = server.active_torrents[info_hash]
+            await asyncio.wait_for(data["task"], 2)
+        self.assertEqual(data["status"], "error")
+        self.assertEqual(data["progress"], 100)
+        self.assertEqual(target.read_bytes(), b"original")
+        self.assertFalse(data["piece_manager"].closed)
+        with patch.object(server, "TrackerClient", side_effect=AssertionError("Already verified")):
+            await self.client.post(f"/api/torrents/{info_hash}/start", headers=self.headers)
+            await asyncio.wait_for(data["task"], 2)
+        self.assertEqual(data["status"], "completed")
+        self.assertEqual(target.read_bytes(), b"ABCD")
+        self.assertTrue(data["piece_manager"].closed)
+
+    async def test_real_tcp_seed_choke_resume_and_full_file_save(self):
+        payload = b"wire" * (256 * 1024)
+        info_hash = (await self.add(torrent_bytes(payload=payload, piece_length=262144))).json()["info_hash"]
+        data = server.active_torrents[info_hash]
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener, ThreadPoolExecutor(max_workers=1) as pool:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(3)
+            future = pool.submit(serve_seed, listener, data["torrent"], payload)
+            tracker = SimpleNamespace(peer_id=b"p" * 20,
+                                      get_peers=lambda: [("127.0.0.1", listener.getsockname()[1])])
+            try:
+                with patch.object(server, "TrackerClient", return_value=tracker):
+                    await self.client.post(f"/api/torrents/{info_hash}/start", headers=self.headers)
+                    await asyncio.wait_for(data["task"], 5)
+            finally:
+                await server._stop_download(data)
+            requests = future.result(timeout=3)
+        self.assertEqual(data["status"], "completed")
+        self.assertEqual((server.DOWNLOAD_DIR / "data.bin").read_bytes(), payload)
+        self.assertGreater(requests, len(payload) // PieceManager.BLOCK_SIZE)
+        self.assertTrue(data["piece_manager"].closed)
+        self.assertFalse(data["connections"])
 
     async def test_all_failed_workers_terminate_with_error(self):
         info_hash = (await self.add()).json()["info_hash"]
@@ -369,6 +494,7 @@ class PeerNegotiationTests(unittest.TestCase):
 
         peer.receive_message = receive
         data = {"stop_event": threading.Event(), "connections": set(),
+                "piece_count": 1,
                 "connections_lock": threading.Lock(),
                 "piece_manager": SimpleNamespace(get_bitfield=lambda: b"\x00")}
         clock = [0]
@@ -386,6 +512,7 @@ class PeerNegotiationTests(unittest.TestCase):
 
     def test_stop_during_negotiation_closes_and_unregisters_peer(self):
         data = {"stop_event": threading.Event(), "connections": set(),
+                "piece_count": 1,
                 "connections_lock": threading.Lock(),
                 "piece_manager": SimpleNamespace(get_bitfield=lambda: b"\x00")}
         peer = FakePeer()
@@ -414,6 +541,7 @@ class PeerNegotiationTests(unittest.TestCase):
         peer.send_bitfield = lambda bits: events.append(("bitfield", bits))
         peer.send_interested = lambda: events.append("interested")
         data = {"stop_event": threading.Event(), "connections": set(),
+                "piece_count": 2,
                 "connections_lock": threading.Lock(),
                 "piece_manager": SimpleNamespace(get_bitfield=lambda: b"\x80")}
         with patch.object(server, "PeerConnection", return_value=peer):

@@ -26,11 +26,14 @@ class MessageType(IntEnum):
 class PeerConnection:
     MAX_MESSAGE_LENGTH = 1024 * 1024
 
-    def __init__(self, ip, port, info_hash, peer_id):
+    def __init__(self, ip, port, info_hash, peer_id, piece_count):
+        if type(piece_count) is not int or piece_count < 0:
+            raise ValueError("Invalid piece count")
         self.ip = ip
         self.port = port
         self.info_hash = info_hash
         self.peer_id = peer_id
+        self.piece_count = piece_count
         self.socket = None
         self.connected = False
 
@@ -39,6 +42,7 @@ class PeerConnection:
         self.peer_choking = True
         self.peer_interested = False
         self.peer_pieces = set()  #which peer has piece
+        self.sent_bitfield = b""
         self._receive_buffer = bytearray()
         self._send_lock = threading.Lock()
 
@@ -125,6 +129,7 @@ class PeerConnection:
 
     def send_bitfield(self, bitfield):
         self._send_message(MessageType.BITFIELD, bitfield)
+        self.sent_bitfield = bytes(bitfield)
 
     def _send_message(self, message_type, payload=b''):
         length = 1 + len(payload)
@@ -149,8 +154,15 @@ class PeerConnection:
                 del self._receive_buffer[:4]
                 return (None, b'')
 
-            self._buffer_until(4 + length)
+            self._buffer_until(5)
             message_id = self._receive_buffer[4]
+            if message_id == MessageType.BITFIELD and length != 1 + (self.piece_count + 7) // 8:
+                raise ValueError("Bitfield does not match torrent metadata")
+            if message_id == MessageType.HAVE and length != 5:
+                raise ValueError("Invalid HAVE message")
+            if message_id in {0, 1, 2, 3} and length != 1:
+                raise ValueError("Invalid control message")
+            self._buffer_until(4 + length)
             payload = bytes(self._receive_buffer[5:4 + length])
             del self._receive_buffer[:4 + length]
 
@@ -167,7 +179,10 @@ class PeerConnection:
             elif message_id == MessageType.HAVE:
                 if len(payload) != 4:
                     raise ValueError("Invalid HAVE message")
-                self.peer_pieces.add(struct.unpack(">I", payload)[0])
+                index = struct.unpack(">I", payload)[0]
+                if index >= self.piece_count:
+                    raise ValueError("HAVE index exceeds torrent metadata")
+                self.peer_pieces.add(index)
 
             return (message_id, payload)
 
@@ -175,6 +190,11 @@ class PeerConnection:
             return None
 
     def _handle_bitfield(self, bitfield): #bitfield, what pieces peer has
+        if len(bitfield) != (self.piece_count + 7) // 8:
+            raise ValueError("Bitfield does not match torrent metadata")
+        padding = (-self.piece_count) % 8
+        if padding and bitfield[-1] & ((1 << padding) - 1):
+            raise ValueError("Nonzero bitfield padding")
         self.peer_pieces = set()
 
         for byte_index, byte in enumerate(bitfield):
